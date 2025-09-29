@@ -1,0 +1,4 @@
+- [ ] Edit Dockerfile to replace actual URLs with placeholders
+- [ ] Edit configs/secrets.env to replace registry URL
+- [ ] Edit scripts/push_metrics.py to replace localhost URL
+- [ ] Edit .git/config to replace GitHub URL

@@ -1,4 +1,4 @@
-# Dockerfile for QA Test Automation Framework
+C# Dockerfile for QA Test Automation Framework
 FROM python:3.11-slim
 
 # Set environment variables
