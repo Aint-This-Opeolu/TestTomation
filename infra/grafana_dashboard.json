@@ -1,0 +1,29 @@
+{
+  "title": "QA Automation Overview",
+  "timezone": "browser",
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Test Runs",
+      "targets": [
+        { "expr": "sum(test_runs_total)" }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Failures",
+      "targets": [
+        { "expr": "sum(test_failures_total)" }
+      ]
+    },
+    {
+      "type": "graph",
+      "title": "Avg Duration (s)",
+      "targets": [
+        { "expr": "avg(avg_test_duration_seconds)" }
+      ]
+    }
+  ],
+  "time": { "from": "now-7d", "to": "now" }
+}
+

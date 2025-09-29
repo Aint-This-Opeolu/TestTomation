@@ -1,0 +1,5 @@
+extends: base
+network:
+  vpn_required: true
+  host: qa.example.com
+

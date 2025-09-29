@@ -1,0 +1,304 @@
+# GitLab CI/CD Pipeline Configuration for QA Test Automation Framework
+
+stages:
+  - precheck
+  - build
+  - test
+  - perf
+  - security
+  - a11y
+  - push
+  - deploy
+  - post-deploy
+
+variables:
+  GIT_STRATEGY: fetch
+  PYTHON_VERSION: "3.11"
+  VPN_REQUIRED: "true"
+  DOCKER_DRIVER: overlay2
+  SLACK_WEBHOOK_URL: ""
+  S3_BUCKET: ""
+  PUSHGATEWAY_URL: ""
+  METRICS_JOB: qa_tests
+  METRICS_LABELS: "branch=${CI_COMMIT_REF_NAME}"
+  # These variables should be set in GitLab CI/CD settings or injected from Vault
+  # DOCKER_REGISTRY_URL: "<registry.remita.net>"
+  # DOCKER_REGISTRY_USER: "<registry_user>"
+  # DOCKER_REGISTRY_PASSWORD: "<registry_password>"
+  # PORTAINER_API_KEY: "<portainer_api_key>"
+  # GITLAB_TOKEN: "<gitlab_token>"
+  # VAULT_ADDR: "<vault_address>"
+  # VAULT_ROLE: "<vault_role>"
+
+# Default image for jobs
+default:
+  image: python:${PYTHON_VERSION}
+  before_script:
+    - pip install -r requirements.txt
+
+# Pre-check stage ensures VPN and required services are reachable
+precheck:vpn_check:
+  stage: precheck
+  script:
+    - echo 'Checking VPN connectivity'
+    - bash -c "if [ \"$VPN_REQUIRED\" = \"true\" ]; then (bash scripts/vpn_check.sh || (echo 'VPN not connected' && exit 1)); else echo 'VPN not required'; fi"
+  rules:
+    - if: '$CI_PIPELINE_SOURCE'
+
+precheck:environment_check:
+  stage: precheck
+  script:
+    - echo 'Checking environment and dependencies'
+    - python -V
+    - pip -V
+    - pip install -r requirements.txt
+    - pip install -r requirements-dev.txt
+    - |
+      if [ -n "$VAULT_ADDR" ]; then
+        echo 'Fetching secrets from Vault'
+        eval "$(python scripts/vault_fetch.py)"
+      fi
+    - python -c "import pytest, behave, playwright, selenium; print('All dependencies installed successfully')"
+  rules:
+    - if: '$CI_PIPELINE_SOURCE'
+
+# Build stage for Docker image and static checks
+build:static_checks:
+  stage: build
+  script:
+    - echo 'Running static code checks'
+    - pip install -r requirements-dev.txt
+    - black --check .
+    - flake8 .
+    - pylint src tests
+    - bandit -r src tests
+    - |
+      if command -v snyk >/dev/null 2>&1; then
+        echo 'Running Snyk test'
+        snyk test || true
+      fi
+  artifacts:
+    paths:
+      - reports/
+    expire_in: 1 week
+
+build:build_image:
+  stage: build
+  image: docker:24-dind
+  services:
+    - docker:24-dind
+  before_script:
+    - echo 'Logging in to registry'
+    - echo "$DOCKER_REGISTRY_PASSWORD" | docker login -u "$DOCKER_REGISTRY_USER" --password-stdin $DOCKER_REGISTRY_URL
+  script:
+    - docker build -t $DOCKER_REGISTRY_URL/$CI_PROJECT_PATH:${CI_COMMIT_REF_NAME}-${CI_COMMIT_SHORT_SHA} .
+    - docker tag $DOCKER_REGISTRY_URL/$CI_PROJECT_PATH:${CI_COMMIT_REF_NAME}-${CI_COMMIT_SHORT_SHA} $DOCKER_REGISTRY_URL/$CI_PROJECT_PATH:${CI_COMMIT_REF_NAME}-latest
+  rules:
+    - if: '$CI_COMMIT_BRANCH'
+
+# Test stage for unit, integration, and e2e tests
+test:unit:
+  stage: test
+  script:
+    - echo 'Running unit tests'
+    - mkdir -p reports/junit reports/allure-results reports/html
+    - pytest tests/unit -k 'not slow' --junitxml=reports/junit/unit.xml --alluredir=reports/allure-results --maxfail=1 --html=reports/html/unit.html --self-contained-html -q
+  artifacts:
+    paths:
+      - reports/
+    reports:
+      junit: reports/junit/unit.xml
+  rules:
+    - if: '$CI_COMMIT_BRANCH'
+
+test:integration:
+  stage: test
+  services:
+    - docker:24-dind
+  before_script:
+    - pip install -r requirements.txt
+    - pip install -r requirements-dev.txt
+    - docker-compose -f docker-compose.integration.yml up -d
+  script:
+    - echo 'Running integration tests'
+    - mkdir -p reports/junit reports/allure-results
+    - pytest tests/integration --junitxml=reports/junit/integration.xml --alluredir=reports/allure-results --fixtures-per-test
+  after_script:
+    - docker-compose -f docker-compose.integration.yml down
+  artifacts:
+    paths:
+      - reports/
+    reports:
+      junit: reports/junit/integration.xml
+  rules:
+    - if: '$CI_COMMIT_BRANCH'
+
+test:e2e:
+  stage: test
+  script:
+    - echo 'Running E2E tests'
+    - mkdir -p reports/junit reports/allure-results reports/e2e_artifacts reports/html
+    - pip install playwright
+    - playwright install
+    - pytest tests/e2e -k 'smoke or critical' --headless --junitxml=reports/junit/e2e.xml --alluredir=reports/allure-results --html=reports/html/e2e.html --self-contained-html
+  artifacts:
+    paths:
+      - reports/
+perf:k6_smoke:
+  stage: perf
+  image: grafana/k6:0.47.0
+  script:
+    - echo 'Running k6 smoke test'
+    - k6 run tests/perf/k6_script.js --summary-export=reports/perf-summary.json || true
+  artifacts:
+    paths:
+      - reports/perf-summary.json
+    expire_in: 1 week
+  rules:
+    - if: '$CI_COMMIT_BRANCH'
+
+security:zap_baseline:
+  stage: security
+  image: owasp/zap2docker-stable
+  script:
+    - echo 'Running OWASP ZAP baseline'
+    - export ENVIRONMENT=$(echo $CI_COMMIT_BRANCH | sed 's/main/production/')
+    - export ENV_HOST=$(cat configs/${ENVIRONMENT}.yaml | grep host | awk '{print $2}')
+    - zap-baseline.py -t https://${ENV_HOST} -r reports/zap_report.html || true
+  artifacts:
+    paths:
+      - reports/zap_report.html
+    expire_in: 1 week
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "qa" || $CI_COMMIT_BRANCH == "staging" || $CI_COMMIT_BRANCH == "main"'
+
+a11y:axe_playwright:
+  stage: a11y
+  script:
+    - echo 'Running accessibility scan'
+    - mkdir -p reports/a11y
+    - python tests/a11y/run_a11y_scan.py > reports/a11y/scan.log
+  artifacts:
+    paths:
+      - reports/a11y/
+    expire_in: 1 week
+  rules:
+    - if: '$CI_COMMIT_BRANCH'
+    reports:
+      junit: reports/junit/e2e.xml
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "qa" || $CI_COMMIT_BRANCH == "staging" || $CI_COMMIT_BRANCH == "main"'
+
+# Push stage for Docker image
+push:image:
+  stage: push
+  image: docker:24-dind
+  services:
+    - docker:24-dind
+  before_script:
+    - echo 'Logging in to registry'
+    - echo "$DOCKER_REGISTRY_PASSWORD" | docker login -u "$DOCKER_REGISTRY_USER" --password-stdin $DOCKER_REGISTRY_URL
+  script:
+    - echo 'Pushing Docker image to registry'
+    - docker push $DOCKER_REGISTRY_URL/$CI_PROJECT_PATH:${CI_COMMIT_REF_NAME}-${CI_COMMIT_SHORT_SHA}
+    - docker push $DOCKER_REGISTRY_URL/$CI_PROJECT_PATH:${CI_COMMIT_REF_NAME}-latest
+  rules:
+    - if: '$CI_COMMIT_BRANCH && $CI_COMMIT_BRANCH != "development"'
+      when: on_success
+
+# Deploy stage for Portainer deployment
+deploy:to_environment:
+  stage: deploy
+  image: python:${PYTHON_VERSION}
+  before_script:
+    - pip install -r requirements.txt
+    - pip install python-gitlab docker requests
+  script:
+    - echo 'Deploying to environment'
+    - export ENVIRONMENT=$(echo $CI_COMMIT_BRANCH | sed 's/main/production/')
+    - export STACK_NAME=$(echo $ENVIRONMENT | sed 's/production/prod/')
+    - export COMPOSE_FILE=docker-compose.${ENVIRONMENT}.yml
+    - python scripts/deploy_portainer.py
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "development" || $CI_COMMIT_BRANCH == "qa" || $CI_COMMIT_BRANCH == "staging" || $CI_COMMIT_BRANCH == "main"'
+      when: on_success
+
+# Post-deploy stage for health checks and smoke tests
+post-deploy:health_check:
+  stage: post-deploy
+  script:
+    - echo 'Running health checks'
+    - export ENVIRONMENT=$(echo $CI_COMMIT_BRANCH | sed 's/main/production/')
+    - export ENV_HOST=$(cat configs/${ENVIRONMENT}.yaml | grep host | awk '{print $2}')
+    - curl -f https://${ENV_HOST}/health || (echo 'Health check failed' && exit 1)
+    - curl -f https://${ENV_HOST}/ready || (echo 'Readiness check failed' && exit 1)
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "qa" || $CI_COMMIT_BRANCH == "staging" || $CI_COMMIT_BRANCH == "main"'
+      when: on_success
+
+post-deploy:smoke_test:
+  stage: post-deploy
+  script:
+    - echo 'Running smoke tests'
+    - export ENVIRONMENT=$(echo $CI_COMMIT_BRANCH | sed 's/main/production/')
+    - mkdir -p reports/junit reports/allure-results
+    - pytest tests/e2e -k 'smoke' --headless --junitxml=reports/junit/smoke.xml --alluredir=reports/allure-results
+    - |
+      if [ -n "$SLACK_WEBHOOK_URL" ]; then
+        payload='{"text":":white_check_mark: Smoke tests completed on '$CI_COMMIT_BRANCH'"}'
+        curl -X POST -H 'Content-type: application/json' --data "$payload" "$SLACK_WEBHOOK_URL" || true
+      fi
+  artifacts:
+    paths:
+      - reports/
+    reports:
+      junit: reports/junit/smoke.xml
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "qa" || $CI_COMMIT_BRANCH == "staging" || $CI_COMMIT_BRANCH == "main"'
+      when: on_success
+
+# Rollback job (manual trigger)
+post-deploy:rollback:
+  stage: post-deploy
+  image: python:${PYTHON_VERSION}
+  before_script:
+    - pip install -r requirements.txt
+    - pip install python-gitlab docker requests
+  script:
+    - echo 'Rolling back deployment'
+    - export ENVIRONMENT=$(echo $CI_COMMIT_BRANCH | sed 's/main/production/')
+    - export STACK_NAME=$(echo $ENVIRONMENT | sed 's/production/prod/')
+    - export COMPOSE_FILE=docker-compose.${ENVIRONMENT}.yml
+    - python scripts/rollback_portainer.py
+  when: manual
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "qa" || $CI_COMMIT_BRANCH == "staging" || $CI_COMMIT_BRANCH == "main"'
+
+# Generate and publish Allure report
+post-deploy:allure_report:
+  stage: post-deploy
+  script:
+    - echo 'Generating Allure report'
+    - pip install allure-pytest
+    - allure generate reports/allure-results --clean -o reports/allure-report
+    - |
+      if [ -n "$S3_BUCKET" ]; then
+        pip install boto3
+        python scripts/upload_artifacts_s3.py --bucket "$S3_BUCKET" --prefix "${CI_PROJECT_PATH}/${CI_PIPELINE_ID}" --path reports/
+      fi
+  artifacts:
+    paths:
+      - reports/allure-report
+    expire_in: 1 month
+  rules:
+    - if: '$CI_COMMIT_BRANCH'
+      when: always
+
+# Optional: push basic CI metrics to a Pushgateway
+metrics:pushgateway:
+  stage: post-deploy
+  script:
+    - pip install requests
+    - python scripts/push_metrics.py
+  rules:
+    - if: '$PUSHGATEWAY_URL'

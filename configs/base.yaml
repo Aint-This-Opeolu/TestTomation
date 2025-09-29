@@ -1,0 +1,19 @@
+app:
+  name: QA_Test_Automation_Python_Master_Blueprint
+  version: "1.0"
+
+network:
+  vpn_required: true
+  host: localhost
+
+reporting:
+  allure_results_dir: reports/allure-results
+  allure_report_dir: reports/allure-report
+
+database:
+  host: localhost
+  port: 5432
+  user: qa_user
+  password: qa_password
+  name: qa_db
+

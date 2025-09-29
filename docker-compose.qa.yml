@@ -1,0 +1,95 @@
+version: '3.8'
+
+services:
+  qa-automation:
+    image: ${DOCKER_REGISTRY_URL}/${CI_PROJECT_PATH}:qa-${CI_COMMIT_SHORT_SHA}
+    container_name: qa-automation-qa
+    environment:
+      - PYTHONPATH=/app
+      - ENVIRONMENT=qa
+      - LOG_LEVEL=INFO
+      - DB_HOST=db
+      - DB_PORT=5432
+      - DB_USER=qa_user
+      - DB_PASSWORD=qa_password
+      - DB_NAME=qa_db
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    command: pytest tests/e2e -k 'smoke or critical' --headless
+    networks:
+      - qa-network
+    depends_on:
+      - db
+      - redis
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+        max_attempts: 3
+      update_config:
+        parallelism: 1
+        delay: 10s
+        order: start-first
+        failure_action: rollback
+
+  db:
+    image: postgres:14-alpine
+    container_name: qa-db-qa
+    environment:
+      - POSTGRES_USER=qa_user
+      - POSTGRES_PASSWORD=qa_password
+      - POSTGRES_DB=qa_db
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - qa-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U qa_user -d qa_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+
+  redis:
+    image: redis:7-alpine
+    container_name: qa-redis-qa
+    networks:
+      - qa-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+
+  allure:
+    image: frankescobar/allure-docker-service
+    container_name: allure-service-qa
+    ports:
+      - "5050:5050"
+    volumes:
+      - ./reports/allure-results:/app/allure-results
+      - ./reports/allure-report:/app/default-reports
+    environment:
+      - CHECK_RESULTS_EVERY_SECONDS=30
+      - KEEP_HISTORY=true
+    networks:
+      - qa-network
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+
+networks:
+  qa-network:
+    driver: overlay
+
+volumes:
+  postgres_data:
+    driver: local
