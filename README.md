@@ -141,4 +141,3 @@ For more detailed information, please refer to the documentation in the `docs/` 
 
 ## License
 
-[Your License Here]
